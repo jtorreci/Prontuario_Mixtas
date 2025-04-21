@@ -1,0 +1,1243 @@
+## FILE: requirements.txt
+streamlit
+numpy
+matplotlib
+pandas
+tabulate
+
+## FILE: core/__init__.py
+# Este archivo está vacío, pero es necesario para que Python reconozca 'core' como un paquete.
+
+## FILE: core/materials.py
+# core/materials.py
+import math
+
+DEFAULT_ES = 210000.0  # Módulo de Young del acero (MPa) - Usar 200000 o 210000 según norma aplicable
+
+def calculate_ecm_ec2(fck):
+    """Calcula el módulo de elasticidad secante del hormigón según EC2 (MPa)."""
+    if fck <= 0:
+        return 0
+    # Fórmula Ecm = 22 * (fcm / 10)^0.3, donde fcm = fck + 8
+    fcm = fck + 8
+    ecm = 22000 * math.pow(fcm / 10, 0.3)
+    return ecm
+
+def get_modular_ratio(fck, Es=DEFAULT_ES):
+    """Calcula la relación modular n = Es / Ecm."""
+    Ecm = calculate_ecm_ec2(fck)
+    if Ecm <= 1e-9: # Evitar división por cero o valores muy pequeños
+        # Considerar lanzar un error o devolver infinito/un valor muy grande
+        print(f"Advertencia: Ecm calculado es muy bajo ({Ecm:.2f}) para fck={fck}. La relación modular será muy alta.")
+        return float('inf')
+    return Es / Ecm
+
+## FILE: core/section_analysis.py
+# core/section_analysis.py
+import numpy as np
+# No necesitamos importar get_modular_ratio aquí si se pasa desde fuera
+
+def calculate_section_properties(shapes, homogenize=False, modular_ratio=None):
+    """
+    Calcula las propiedades geométricas de una colección de formas.
+    Si homogenize es True, transforma el HORMIGÓN a ACERO equivalente
+    dividiendo sus propiedades (A, Ix, Iy) por modular_ratio (n=Es/Ecm).
+    Requiere que modular_ratio sea proporcionado si homogenize es True.
+
+    Args:
+        shapes (list): Lista de objetos SteelPlate y ConcreteTrapezoid.
+        homogenize (bool): True para realizar la homogeneización a acero.
+        modular_ratio (float, optional): Relación modular n = Es / Ecm. Necesario si homogenize=True.
+
+    Returns:
+        dict: Diccionario con 'total_area', 'centroid_x', 'centroid_y',
+              'inertia_x', 'inertia_y'.
+
+    Raises:
+        ValueError: Si se intenta homogeneizar sin un modular_ratio válido.
+    """
+    if homogenize and modular_ratio is None:
+        raise ValueError("Se requiere 'modular_ratio' para homogeneizar.")
+    if homogenize and modular_ratio <= 0:
+         raise ValueError("'modular_ratio' debe ser positivo para homogeneizar.")
+
+    total_area = 0.0
+    moment_x = 0.0  # Sum(Ai * yi)
+    moment_y = 0.0  # Sum(Ai * xi)
+    inertia_x_global = 0.0 # Sum(Ix_local_i + Ai * dy_i^2)
+    inertia_y_global = 0.0 # Sum(Iy_local_i + Ai * dx_i^2)
+
+    processed_shapes = [] # Guardaremos las propiedades (A, x, y, Ix, Iy) de cada parte
+
+    for shape in shapes:
+        try:
+            A = shape.area
+            x = shape.cg_x
+            y = shape.cg_y
+            Ix_local = shape.inertia_x_local
+            # Manejar posible None de Iy_local en Trapecio o si no está implementado
+            Iy_local = shape.inertia_y_local if hasattr(shape, 'inertia_y_local') and shape.inertia_y_local is not None else 0.0
+        except AttributeError as e:
+             raise AttributeError(f"El objeto {type(shape)} no tiene una propiedad necesaria: {e}")
+
+
+        if homogenize and hasattr(shape, 'material') and shape.material == "concrete":
+            # Homogeneizar hormigón a acero dividiendo por n
+            # Se asume que Ix e Iy locales escalan con 1/n.
+            # (Verificado para Ix, pero Iy puede tener dependencia n^3 para formas como rectángulos)
+            # Procedemos con 1/n para ambos por simplicidad inicial, enfocado en Ix.
+            if modular_ratio == 0: # Doble chequeo por si acaso
+                 raise ValueError("Intento de división por cero en homogeneización (modular_ratio=0).")
+            A /= modular_ratio
+            Ix_local /= modular_ratio
+            Iy_local /= modular_ratio # Precaución con esta simplificación para Iy
+
+        # Las partes de acero no cambian en esta homogeneización
+        # else: # shape.material == "steel" or not homogenize
+        #     pass # Keep original properties
+
+        # Ignorar formas con área nula o negativa (podría ocurrir con escalas raras)
+        if abs(A) > 1e-9: # Usar abs() por si acaso
+            processed_shapes.append({'A': A, 'x': x, 'y': y, 'Ix': Ix_local, 'Iy': Iy_local})
+            total_area += A
+            moment_x += A * y
+            moment_y += A * x
+        # else: # Opcional: Informar si se ignora una forma
+             # print(f"Advertencia: Ignorando forma {type(shape)} con área calculada cercana a cero: {A}")
+
+
+    if abs(total_area) < 1e-9:
+        # Devuelve ceros si el área total es despreciable
+        return {'total_area': 0, 'centroid_x': 0, 'centroid_y': 0, 'inertia_x': 0, 'inertia_y': 0}
+
+    # Calcular centroide global
+    centroid_x = moment_y / total_area
+    centroid_y = moment_x / total_area
+
+    # Calcular inercias globales usando el Teorema de Steiner (Ejes Paralelos)
+    for props in processed_shapes:
+        dy = props['y'] - centroid_y
+        dx = props['x'] - centroid_x
+        # Steiner: I_global = Sum( I_local_cg + A * d^2 )
+        inertia_x_global += props['Ix'] + props['A'] * dy**2
+        inertia_y_global += props['Iy'] + props['A'] * dx**2
+
+    return {
+        'total_area': total_area,
+        'centroid_x': centroid_x,
+        'centroid_y': centroid_y,
+        'inertia_x': inertia_x_global, # Inercia respecto al eje X que pasa por el CDG global
+        'inertia_y': inertia_y_global  # Inercia respecto al eje Y que pasa por el CDG global
+    }
+
+## FILE: core/stress_analysis.py
+# core/stress_analysis.py
+import numpy as np
+
+def calculate_navier_stress(N_ed, Mx_ed, shapes, homog_props):
+    """
+    Calcula tensiones elásticas y fibra neutra usando Navier en sección homogeneizada.
+
+    Args:
+        N_ed (float): Esfuerzo Axil (N). Positivo = Tracción, Negativo = Compresión.
+        Mx_ed (float): Momento Flector respecto a eje X centroidal (N·mm).
+                       Convenio: Positivo comprime fibras superiores (y > y_G).
+        shapes (list): Lista de objetos de forma originales.
+        homog_props (dict): Propiedades de la sección homogeneizada a acero
+                            {'total_area', 'centroid_y', 'inertia_x'}.
+
+    Returns:
+        dict: Contiene 'y_na' (posición fibra neutra), 'stresses' (dict con tensiones
+              en puntos clave), 'error' (mensaje de error si lo hay).
+    """
+    A_h = homog_props.get('total_area')
+    Iy_h = homog_props.get('inertia_x') # Usamos la inercia respecto al eje X centroidal global
+    y_G = homog_props.get('centroid_y')
+
+    results = {'y_na': None, 'stresses': {}, 'error': None}
+
+    # Validaciones básicas
+    if A_h is None or Iy_h is None or y_G is None:
+        results['error'] = "Faltan propiedades homogeneizadas (A, Ix, yG)."
+        return results
+    if abs(A_h) < 1e-9:
+        results['error'] = "Área homogeneizada es prácticamente cero."
+        return results
+    # Permitir Inercia cero solo si no hay momento? O error directo? Mejor error.
+    if abs(Iy_h) < 1e-9 and abs(Mx_ed) > 1e-9 :
+         results['error'] = "Inercia X homogeneizada nula con momento aplicado."
+         return results
+
+    # Calcular Tensión debida al Axil
+    sigma_axial = N_ed / A_h if A_h != 0 else 0
+
+    # --- Calcular Fibra Neutra (y_NA) ---
+    # y_NA = y_G + (N_ed * Iy_h) / (Mx_ed * A_h)  (Convenio M+ tracciona arriba)
+    # Con nuestro convenio M+ comprime arriba:
+    # 0 = N/A - M/I * (y_NA - y_G) -> y_NA - y_G = N*I / (M*A)
+    y_na = None
+    if abs(Mx_ed) > 1e-9: # Evitar división por cero si no hay momento
+        try:
+            y_na = y_G + (N_ed * Iy_h) / (Mx_ed * A_h)
+            results['y_na'] = y_na
+        except ZeroDivisionError:
+             results['error'] = "División por cero al calcular y_NA (A o M pueden ser cero)."
+             # No continuar si hay error aquí
+             return results
+    elif abs(N_ed) < 1e-9: # Puro momento nulo o puro axil nulo -> Tensión cero
+         y_na = None # Fibra neutra en el infinito o indeterminada
+         results['y_na'] = None # Indicar que no aplica o está en infinito
+         # Las tensiones serán cero, lo calculamos abajo
+    else: # Solo Axil (N_ed != 0, Mx_ed = 0)
+        y_na = float('inf') if N_ed != 0 else None # Fibra neutra en infinito
+        results['y_na'] = y_na
+
+    # --- Calcular Tensiones en puntos clave ---
+    stresses = {}
+    for i, shape in enumerate(shapes):
+        try:
+            y_min_shape = shape.y_min
+            y_max_shape = shape.y_max
+
+            # Calcular tensión en la fibra inferior y superior de la forma
+            # sigma(y) = sigma_axial - (Mx_ed / Iy_h) * (y - y_G)
+            sigma_min = sigma_axial
+            sigma_max = sigma_axial
+            if abs(Iy_h) > 1e-9: # Solo añadir término de momento si la inercia no es nula
+                sigma_min -= (Mx_ed / Iy_h) * (y_min_shape - y_G)
+                sigma_max -= (Mx_ed / Iy_h) * (y_max_shape - y_G)
+
+            # Guardar tensiones (éstas son en acero equivalente)
+            stresses[f'shape_{i+1}_ymin'] = {'y': y_min_shape, 'sigma_eq': sigma_min, 'mat': shape.material}
+            stresses[f'shape_{i+1}_ymax'] = {'y': y_max_shape, 'sigma_eq': sigma_max, 'mat': shape.material}
+
+            # Podríamos añadir puntos intermedios o CDG si fuera necesario
+            # y_cg_shape = shape.cg_y
+            # sigma_cg = sigma_axial - (Mx_ed / Iy_h) * (y_cg_shape - y_G) if Iy_h != 0 else sigma_axial
+            # stresses[f'shape_{i+1}_ycg'] = {'y': y_cg_shape, 'sigma_eq': sigma_cg, 'mat': shape.material}
+
+        except AttributeError:
+            print(f"Advertencia: Forma {i+1} ({type(shape)}) no tiene y_min/y_max, no se calculan tensiones.")
+        except Exception as e:
+             print(f"Error calculando tensiones para forma {i+1}: {e}")
+             results['error'] = f"Error calculando tensión en forma {i+1}."
+             # Podríamos decidir continuar o parar aquí
+
+    results['stresses'] = stresses
+    return results
+
+## FILE: core/classification_ec3.py
+# core/classification_ec3.py
+import math
+
+# Límites c/t de EC3 Tabla 5.2 para clases (simplificado, usando valores para S235)
+# Estos deberían ajustarse con epsilon = sqrt(235/fy)
+# Usaremos límites conservadores (compresión pura) inicialmente para simplificar
+
+# Límites para alas a compresión (Outstand flanges) - Compresión Pura
+CLASS_LIMITS_FLANGE_COMP = {
+    1: 9.0,
+    2: 10.0,
+    3: 14.0,
+}
+# Límites para almas a compresión (Internal compression parts) - Compresión Pura
+CLASS_LIMITS_WEB_COMP = {
+    1: 33.0,
+    2: 38.0,
+    3: 42.0,
+}
+
+def get_element_class(ratio_ct, epsilon, element_type="internal"):
+    """Clasifica un elemento basado en c/t, epsilon y tipo."""
+    if element_type == "outstand":
+        limits = CLASS_LIMITS_FLANGE_COMP
+    else: # internal (web)
+        limits = CLASS_LIMITS_WEB_COMP
+
+    if ratio_ct <= limits[1] * epsilon:
+        return 1
+    elif ratio_ct <= limits[2] * epsilon:
+        return 2
+    elif ratio_ct <= limits[3] * epsilon:
+        return 3
+    else:
+        return 4
+
+def classify_section_ec3(shapes, y_na, fy):
+    """
+    Realiza una clasificación SIMPLIFICADA de elementos de acero según EC3.
+
+    Args:
+        shapes (list): Lista de objetos de forma (SteelPlate, RotatedSteelPlate).
+        y_na (float or None): Posición de la fibra neutra. Infinito si solo axil. None si sin tensiones.
+        fy (float): Límite elástico del acero (MPa).
+
+    Returns:
+        dict: Contiene 'element_classes' (dict con clase por elemento),
+              'overall_class' (clase global de la sección), 'warnings' (list).
+    """
+    results = {'element_classes': {}, 'overall_class': 1, 'warnings': []}
+    if fy <= 0:
+        results['warnings'].append("Fy inválido, no se puede calcular epsilon.")
+        return results # No podemos clasificar sin fy
+
+    epsilon = math.sqrt(235.0 / fy)
+    max_class = 0 # Empezamos asumiendo clase 1 (la más favorable)
+
+    for i, shape in enumerate(shapes):
+        # Solo clasificamos chapas de acero
+        if not hasattr(shape, 'material') or shape.material != "steel":
+            continue
+
+        element_key = f"steel_shape_{i+1}"
+        shape_class = 1 # Asumir clase 1 por defecto si no está comprimido o no se analiza
+        is_compressed = False # Flag para saber si alguna parte está comprimida
+
+        try:
+            y_min = shape.y_min
+            y_max = shape.y_max
+            t = 0.0 # Espesor
+            c = 0.0 # Dimensión 'c' relevante para pandeo
+            element_type = "internal" # Tipo por defecto
+
+            # Determinar si la chapa está (parcialmente) en compresión
+            # Necesitamos y_na. Si y_na es None o inf, la clasificación es diferente
+            # (p.ej., compresión uniforme si y_na=inf y N<0).
+            # Simplificación: si y_na es finito, asumimos flexión o flexo-compresión.
+            if isinstance(y_na, (int, float)):
+                # Asumimos compresión si la fibra neutra corta la pieza
+                if y_na < y_max and y_na > y_min:
+                    # Compresión parcial. Determinar la parte comprimida
+                    # Si y_na > cg_y -> parte superior comprimida (y_na a y_max)
+                    # Si y_na < cg_y -> parte inferior comprimida (y_min a y_na)
+                    # Esta lógica asume M+ comprime arriba, necesita ser consistente con Navier
+                    # Nuestro convenio Navier M+ comprime arriba (y>y_G)
+                    # Nuestro cálculo de y_NA es y_NA = y_G + N*I/(M*A)
+                    # Si M>0 (comprime arriba) y N=0, y_NA=y_G -> parte >y_G comprimida
+                    # Si M>0 y N<0 (compresión), y_NA > y_G -> parte >y_NA comprimida
+                    # Si M>0 y N>0 (tracción), y_NA < y_G -> parte >y_G comprimida
+                    # Es complejo determinar la zona exacta sin las tensiones sigma_min/max
+
+                    # Simplificación GROSERA: Si la FN corta, asumimos compresión y usamos la peor clase
+                    # calculada como alma o ala, usando dimensiones totales. ¡Muy conservador!
+                    is_compressed = True
+
+                    # --- Lógica simplificada para SteelPlate ---
+                    if isinstance(shape, SteelPlate):
+                        h_dim = shape.height # Dimensión Y
+                        w_dim = shape.width  # Dimensión X
+                        # Heurística: Alma si H > W, Ala si W >= H
+                        if h_dim > w_dim : # Alma vertical
+                             element_type = "internal"
+                             t = shape.width
+                             c = shape.height # Altura total comprimida (conservador)
+                        else: # Ala horizontal
+                             element_type = "outstand"
+                             t = shape.height
+                             c = shape.width / 2 # Voladizo (conservador)
+
+                    # --- Lógica simplificada para RotatedSteelPlate ---
+                    elif isinstance(shape, RotatedSteelPlate):
+                         element_type = "outstand" # Suponer siempre ala? O tratar como alma?
+                         t = shape.t
+                         c = shape.L # Usar longitud total? Muy conservador
+                         results['warnings'].append(f"Clasificación Rotada {i+1} conservadora (c=L, t=t).")
+
+                # Caso: Todo comprimido (y_na <= y_min) - Requiere comprobar signo N o tensiones
+                # Caso: Todo traccionado (y_na >= y_max) - Clase 1
+                # Simplificación: Si y_na está fuera, asumimos que la compresión domina si y_na está abajo
+                elif y_na is not None and y_na <= y_min: # Potencialmente todo comprimido
+                     is_compressed = True # Necesitaría chequeo de N o sigma
+                     # Usar dimensiones totales como antes para ser conservador
+                     if isinstance(shape, SteelPlate):
+                          h_dim, w_dim = shape.height, shape.width
+                          if h_dim > w_dim: t, c, element_type = w_dim, h_dim, "internal"
+                          else: t, c, element_type = h_dim, w_dim / 2, "outstand"
+                     elif isinstance(shape, RotatedSteelPlate):
+                          t, c, element_type = shape.t, shape.L, "outstand" # Conservador
+                          results['warnings'].append(f"Clasificación Rotada {i+1} conservadora (c=L, t=t).")
+
+            # Si solo hay axil de compresión (y_na = +/- inf), todo está comprimido
+            # Necesitaríamos N_ed aquí para saber el signo. Omitimos este caso por ahora.
+
+
+            # Calcular clase si está comprimido y dimensiones válidas
+            if is_compressed and t > 1e-6:
+                ratio_ct = c / t
+                shape_class = get_element_class(ratio_ct, epsilon, element_type)
+                # Sobrescribir a Clase 1 si está conectado a hormigón (NO IMPLEMENTADO)
+                # if is_connected_to_concrete(shape): shape_class = 1
+            else:
+                 shape_class = 1 # Si no está comprimido o espesor nulo
+
+        except AttributeError:
+            results['warnings'].append(f"Forma {i+1} ({type(shape)}) sin props. y_min/y_max para clasificación.")
+            shape_class = 4 # Clase desconocida o no analizable -> pesimista
+        except Exception as e:
+             results['warnings'].append(f"Error clasificando forma {i+1}: {e}")
+             shape_class = 4
+
+        results['element_classes'][element_key] = shape_class
+        if shape_class > max_class:
+            max_class = shape_class
+
+    # La clase global es la peor (más alta) de los elementos comprimidos
+    results['overall_class'] = max_class
+
+    # Advertencia sobre la no implementación de la regla EC4
+    results['warnings'].append("Regla EC4 (contacto ala-hormigón -> Clase 1) NO implementada.")
+    results['warnings'].append("Clasificación basada en heurística simple (alma/ala) y dimensiones totales comprimidas (conservador).")
+
+    return results
+
+## FILE: shapes/__init__.py
+# Este archivo está vacío, pero es necesario para que Python reconozca 'shapes' como un paquete.
+
+## FILE: shapes/steel_plate.py
+# shapes/steel_plate.py
+import numpy as np
+
+class SteelPlate:
+    """Representa una chapa de acero rectangular alineada con los ejes globales X,Y."""
+    def __init__(self, width, height, cg_x, cg_y):
+        self.width = float(width)   # Dimensión paralela al eje X
+        self.height = float(height) # Dimensión paralela al eje Y
+        self.cg_x = float(cg_x)
+        self.cg_y = float(cg_y)
+        self.material = "steel"
+
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("El ancho y alto de la chapa deben ser positivos.")
+
+    @property
+    def area(self):
+        return self.width * self.height
+
+    @property
+    def inertia_x_local(self):
+        """Inercia respecto al eje x que pasa por su CDG local (paralelo a X global)."""
+        # Eje horizontal por el centroide: b*h^3/12 -> width * height^3 / 12
+        return self.width * self.height**3 / 12
+
+    @property
+    def inertia_y_local(self):
+        """Inercia respecto al eje y que pasa por su CDG local (paralelo a Y global)."""
+        # Eje vertical por el centroide: h*b^3/12 -> height * width^3 / 12
+        return self.height * self.width**3 / 12
+
+    @property
+    def y_min(self):
+        return self.cg_y - self.height / 2
+    @property
+    def y_max(self):
+        return self.cg_y + self.height / 2
+    @property
+    def x_min(self):
+        return self.cg_x - self.width / 2
+    @property
+    def x_max(self):
+        return self.cg_x + self.width / 2
+
+    def get_vertices(self, width_scale_factor=1.0):
+        """
+        Devuelve las coordenadas de los 4 vértices para dibujar.
+        El 'width_scale_factor' solo afecta si se quisiera visualizar
+        la homogeneización de acero (normalmente no se hace).
+        Aquí escala la dimensión 'width' (paralela a X).
+        """
+        scaled_width = self.width * width_scale_factor
+        half_w = scaled_width / 2
+        half_h = self.height / 2 # La altura (paralela a Y) no se escala por defecto
+
+        return [
+            (self.cg_x - half_w, self.cg_y - half_h), # Bottom-left
+            (self.cg_x + half_w, self.cg_y - half_h), # Bottom-right
+            (self.cg_x + half_w, self.cg_y + half_h), # Top-right
+            (self.cg_x - half_w, self.cg_y + half_h)  # Top-left
+        ]
+
+## FILE: shapes/concrete_trapezoid.py
+# shapes/concrete_trapezoid.py
+import numpy as np
+
+class ConcreteTrapezoid:
+    """
+    Representa un trapecio de hormigón, definido por anchos inferior/superior,
+    altura y coordenadas del centro de la base inferior.
+    Se asume simetría vertical respecto al eje que pasa por el centro de la base inferior.
+    """
+    def __init__(self, bottom_width, top_width, height, bottom_center_x, bottom_center_y):
+        self.b1 = float(bottom_width)  # Ancho inferior
+        self.b2 = float(top_width)    # Ancho superior
+        self.h = float(height)
+        self.bc_x = float(bottom_center_x) # X del centro de la base inferior
+        self.bc_y = float(bottom_center_y) # Y del centro (y nivel) de la base inferior
+        self.material = "concrete"
+
+        if self.h <= 0:
+             raise ValueError("La altura del trapecio debe ser positiva.")
+        if self.b1 < 0 or self.b2 < 0:
+             raise ValueError("Los anchos del trapecio no pueden ser negativos.")
+
+    @property
+    def area(self):
+        return (self.b1 + self.b2) / 2 * self.h
+
+    @property
+    def cg_y_local(self):
+        """Distancia vertical del CDG a la base inferior."""
+        sum_b = self.b1 + self.b2
+        if abs(sum_b) < 1e-9: # Evitar división por cero si el área es 0 (b1=b2=0)
+             # Si el área es cero, el CDG está indefinido, pero podemos devolver la mitad de la altura
+             # o manejarlo como un caso especial. Devolver h/2 es razonable.
+             return self.h / 2
+        # Fórmula para la posición Y del Cdg respecto a la base inferior
+        return (self.h / 3) * (self.b1 + 2 * self.b2) / sum_b
+
+    @property
+    def cg_x(self):
+        """Coordenada X global del CDG (asume simetría respecto al eje vertical que pasa por bc_x)."""
+        # Para un trapecio isósceles (o definido simétricamente), el CDG está en el eje de simetría
+        return self.bc_x
+
+    @property
+    def cg_y(self):
+        """Coordenada Y global del CDG."""
+        return self.bc_y + self.cg_y_local
+
+    @property
+    def inertia_x_local(self):
+        """Inercia respecto al eje x que pasa por su CDG local (paralelo a X global)."""
+        sum_b = self.b1 + self.b2
+        if abs(sum_b) < 1e-9:
+            return 0 # Inercia cero si el área es cero
+        # Fórmula de la inercia de un trapecio respecto a su eje centroidal horizontal
+        return (self.h**3 / 36) * (self.b1**2 + 4 * self.b1 * self.b2 + self.b2**2) / sum_b
+
+    @property
+    def inertia_y_local(self):
+        """Inercia respecto al eje y que pasa por su CDG local (paralelo a Y global, asume simetría)."""
+        # Fórmula para trapecio simétrico respecto al eje vertical centroidal
+        sum_b = self.b1 + self.b2
+        if abs(sum_b) < 1e-9 or self.h == 0:
+            return 0.0
+        try:
+            # Esta fórmula SÍ parece corresponder a la inercia respecto al eje Y centroidal para un trapecio ISÓSCELES.
+            inertia = (self.h * (self.b1 + self.b2) * (self.b1**2 + self.b2**2)) / 48.0
+            return inertia
+        except ZeroDivisionError:
+            return 0.0
+
+    @property
+    def y_min(self):
+        return self.bc_y
+    @property
+    def y_max(self):
+        return self.bc_y + self.h
+    @property
+    def x_min(self):
+        # El mínimo X está en el borde exterior de la base o el top, el que sea más ancho
+        max_half_b = max(self.b1 / 2, self.b2 / 2) if self.b1 >= 0 and self.b2 >= 0 else 0
+        return self.bc_x - max_half_b
+    @property
+    def x_max(self):
+        max_half_b = max(self.b1 / 2, self.b2 / 2) if self.b1 >= 0 and self.b2 >= 0 else 0
+        return self.bc_x + max_half_b
+
+    def get_vertices(self, width_scale_factor=1.0):
+        """
+        Devuelve las coordenadas de los 4 vértices para dibujar.
+        El 'width_scale_factor' escala los anchos b1 y b2 (usado para visualizar homogeneización).
+        """
+        scaled_b1 = self.b1 * width_scale_factor
+        scaled_b2 = self.b2 * width_scale_factor
+        half_b1 = scaled_b1 / 2
+        half_b2 = scaled_b2 / 2
+        # bc_x es el centro de la base inferior original. El escalado se hace simétrico respecto a él.
+        return [
+            (self.bc_x - half_b1, self.bc_y),             # Bottom-left
+            (self.bc_x + half_b1, self.bc_y),             # Bottom-right
+            (self.bc_x + half_b2, self.bc_y + self.h),    # Top-right
+            (self.bc_x - half_b2, self.bc_y + self.h)     # Top-left
+        ]
+
+## FILE: shapes/rotated_steel_plate.py
+# shapes/rotated_steel_plate.py
+import numpy as np
+import math
+
+class RotatedSteelPlate:
+    """
+    Representa una chapa de acero rectangular con un espesor, definida por:
+    1) Punto inicial, punto final y espesor.
+    2) Punto inicial, vector director, longitud y espesor.
+    La chapa puede estar rotada en el plano XY.
+    """
+    def __init__(self, thickness, p1=None, p2=None, vector=None, length=None, definition_method=None):
+        """
+        Inicializa la chapa rotada.
+
+        Args:
+            thickness (float): Espesor de la chapa (será el 'ancho' local).
+            p1 (tuple, optional): Coordenadas (x1, y1) del punto inicial. Requerido si no se usa vector/length.
+            p2 (tuple, optional): Coordenadas (x2, y2) del punto final. Requerido si no se usa vector/length.
+            vector (tuple, optional): Vector director (vx, vy). Usado con p1 y length.
+            length (float, optional): Longitud de la chapa. Usado con p1 y vector.
+            definition_method (str, optional): Almacena cómo fue definida ('Points' o 'Vector') para la edición.
+
+        Raises:
+            ValueError: Si los argumentos de entrada no son suficientes o son inconsistentes.
+        """
+        self.t = float(thickness)
+        self.material = "steel"
+        self.definition_method = definition_method # Guardar para la edición
+
+        if self.t <= 0:
+             raise ValueError("El espesor de la chapa debe ser positivo.")
+
+        if p1 is None:
+            raise ValueError("El punto inicial 'p1' es requerido.")
+        self.p1 = np.array(p1, dtype=float)
+
+        if p2 is not None:
+            # Definición por p1 y p2
+            self.p2 = np.array(p2, dtype=float)
+            if vector is not None or length is not None:
+                # Permitir pero advertir puede ser peligroso si los datos son inconsistentes.
+                # Mejor ser estricto o elegir una prioridad clara.
+                # print("Advertencia: Se proporcionaron p1/p2 y vector/length. Se usarán p1 y p2.")
+                pass # Ignorar vector/length si se dan p1 y p2
+            diff = self.p2 - self.p1
+            self.L = np.linalg.norm(diff)
+            if self.L < 1e-9:
+                raise ValueError("Los puntos p1 y p2 son coincidentes (longitud cero).")
+            # Vector director unitario
+            self.u_dir = diff / self.L
+            # Calcular vector y longitud originales para posible edición
+            self._vector_original = tuple(diff) # Guardar vector no unitario
+            self._length_original = self.L # Guardar longitud
+            if not self.definition_method: self.definition_method = 'Points'
+
+        elif vector is not None and length is not None:
+            # Definición por p1, vector y length
+            self.L = float(length)
+            if self.L <= 0:
+                raise ValueError("La longitud 'length' debe ser positiva.")
+            v = np.array(vector, dtype=float)
+            v_norm = np.linalg.norm(v)
+            if v_norm < 1e-9:
+                raise ValueError("El vector director no puede ser cero.")
+            # Vector director unitario
+            self.u_dir = v / v_norm
+            self.p2 = self.p1 + self.L * self.u_dir
+             # Guardar vector y longitud originales para posible edición
+            self._vector_original = tuple(v)
+            self._length_original = self.L
+            if not self.definition_method: self.definition_method = 'Vector'
+        else:
+            raise ValueError("Debe proporcionar 'p2' o ('vector' y 'length').")
+
+        # Calcular ángulo con el eje X global (en radianes)
+        self.theta = math.atan2(self.u_dir[1], self.u_dir[0])
+
+        # Calcular centro de gravedad (punto medio del eje longitudinal)
+        self.cg_x = (self.p1[0] + self.p2[0]) / 2
+        self.cg_y = (self.p1[1] + self.p2[1]) / 2
+
+    @property
+    def area(self):
+        """Área de la chapa."""
+        return self.L * self.t
+
+    # --- Propiedades de Inercia ---
+    # Calculamos Ix e Iy respecto a ejes paralelos a los globales X,Y
+    # pero que pasan por el CDG de la chapa.
+
+    @property
+    def inertia_x_local(self):
+        """Inercia respecto a eje X' // X global, pasando por CDG local."""
+        # Iu = Inercia sobre eje longitudinal (u) = t * L^3 / 12
+        # Iv = Inercia sobre eje transversal (v) = L * t^3 / 12
+        # Nota: 'u' es el eje a lo largo de L, 'v' es el eje a lo largo de t.
+        Iu = self.t * self.L**3 / 12
+        Iv = self.L * self.t**3 / 12
+        sin_t = math.sin(self.theta)
+        cos_t = math.cos(self.theta)
+        # Fórmula de rotación de tensor de inercia:
+        # Ix_cg = (Iu+Iv)/2 + (Iu-Iv)/2 * cos(2*theta) <-- Incorrecto para ejes X,Y
+        # Usando transformación directa: Ix_cg = Iu*sin^2(theta) + Iv*cos^2(theta)
+        return Iu * sin_t**2 + Iv * cos_t**2
+
+    @property
+    def inertia_y_local(self):
+        """Inercia respecto a eje Y' // Y global, pasando por CDG local."""
+        Iu = self.t * self.L**3 / 12
+        Iv = self.L * self.t**3 / 12
+        sin_t = math.sin(self.theta)
+        cos_t = math.cos(self.theta)
+        # Iy_cg = Iu*cos^2(theta) + Iv*sin^2(theta)
+        return Iu * cos_t**2 + Iv * sin_t**2
+
+    def get_vertices(self, width_scale_factor=1.0):
+        """
+        Devuelve las coordenadas de los 4 vértices de la chapa rectangular.
+        El 'width_scale_factor' escala el espesor (t).
+        """
+        scaled_t = self.t * width_scale_factor
+        if scaled_t < 0: scaled_t = 0 # Evitar espesor negativo
+        half_t = scaled_t / 2
+
+        # Vector normal (perpendicular a u_dir, longitud 1)
+        # Rotar u_dir 90 grados: (x, y) -> (-y, x)
+        u_norm = np.array([-self.u_dir[1], self.u_dir[0]])
+
+        # Calcular los 4 vértices usando p1, p2 y el vector normal escalado
+        v1 = self.p1 + half_t * u_norm
+        v2 = self.p2 + half_t * u_norm
+        v3 = self.p2 - half_t * u_norm
+        v4 = self.p1 - half_t * u_norm
+
+        # Devolver como lista de tuplas
+        return [tuple(v1), tuple(v2), tuple(v3), tuple(v4)]
+
+    # Propiedades para límites bounding box (calculadas a partir de vértices)
+    @property
+    def _vertices_coords(self):
+        """Helper para no recalcular vértices innecesariamente."""
+        # Podríamos cachear esto si fuera costoso, pero por ahora lo recalculamos
+        return self.get_vertices() # Llama al método existente con factor 1.0
+
+    @property
+    def y_min(self):
+        return min(v[1] for v in self._vertices_coords)
+    @property
+    def y_max(self):
+        return max(v[1] for v in self._vertices_coords)
+    @property
+    def x_min(self):
+        return min(v[0] for v in self._vertices_coords)
+    @property
+    def x_max(self):
+        return max(v[0] for v in self._vertices_coords)
+
+## FILE: visualization/__init__.py
+# Este archivo está vacío, pero es necesario para que Python reconozca 'visualization' como un paquete.
+
+## FILE: visualization/plot_section.py
+# visualization/plot_section.py
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import numpy as np
+import math
+
+def plot_section(shapes, title="Sección Transversal", highlight_centroid=None, centroid_label="CDG",
+                 homogenize_visual=False, modular_ratio=None,
+                 xlims=None, ylims=None): # <-- NUEVOS ARGUMENTOS
+    """
+    Dibuja la sección transversal usando Matplotlib.
+    Puede dibujar la sección original o una visualización homogeneizada (Hormigón->Acero).
+    Permite especificar límites de ejes para consistencia entre plots.
+
+    Args:
+        # ... (argumentos anteriores) ...
+        xlims (tuple, optional): Tupla (min_x, max_x) para los límites del eje X.
+        ylims (tuple, optional): Tupla (min_y, max_y) para los límites del eje Y.
+    """
+    if homogenize_visual and (modular_ratio is None or modular_ratio <= 0):
+        # Manejar caso inválido, quizás dibujando la original o mostrando error
+        print(f"Advertencia: modular_ratio inválido ({modular_ratio}) para visualización homogeneizada. Dibujando original.")
+        homogenize_visual = False # Dibujar la original como fallback
+        # O podríamos lanzar un error:
+        # raise ValueError("Se requiere 'modular_ratio' positivo para la visualización homogeneizada.")
+
+
+    # Reducir figsize para que los gráficos sean más pequeños
+    fig, ax = plt.subplots(figsize=(6, 6)) # <- Tamaño ajustado
+
+    all_vertices_plot = [] # Vértices usados para este plot específico (para auto-escala si no se dan límites)
+    legend_handles = {} # Para evitar leyendas duplicadas
+
+    for shape in shapes:
+        scale_factor = 1.0
+        color = 'grey' # Default color
+        hatch = None   # Default hatch
+        base_label = "Desconocido" # Default label
+
+        # Determinar estilo basado en material y si se visualiza homogeneización
+        is_concrete = hasattr(shape, 'material') and shape.material == "concrete"
+        is_steel = hasattr(shape, 'material') and shape.material == "steel"
+
+        label_suffix = ""
+        if is_steel:
+             color = 'lightblue'
+             hatch = '//'
+             base_label = 'Acero'
+        elif is_concrete:
+             color = 'lightgrey'
+             hatch = '..'
+             base_label = 'Hormigón'
+             if homogenize_visual:
+                 # Asegurarse de que modular_ratio es válido antes de dividir
+                 if modular_ratio is not None and modular_ratio > 0:
+                     scale_factor = 1.0 / modular_ratio
+                 else:
+                     scale_factor = 1.0 # O manejar error
+                 # Cambiar estilo para hormigón homogeneizado visualmente
+                 color = 'lightcoral' # Diferente color
+                 hatch = 'xx'
+                 label_suffix = f' (Ancho/{modular_ratio:.2f})' if modular_ratio else ' (Error Ratio)'
+
+
+        # Obtener vértices (escalados si es necesario para este plot)
+        try:
+            vertices = shape.get_vertices(width_scale_factor=scale_factor)
+            all_vertices_plot.extend(vertices) # Añadir a la lista de este plot
+        except TypeError: # Si get_vertices no acepta el argumento (clases antiguas?)
+             print(f"Advertencia: {type(shape)}.get_vertices no acepta width_scale_factor. Usando factor 1.0.")
+             vertices = shape.get_vertices()
+             all_vertices_plot.extend(vertices)
+        except Exception as e:
+            print(f"Error obteniendo vértices para {type(shape)}: {e}. Saltando forma.")
+            continue # Saltar esta forma si no se pueden obtener los vértices
+
+
+        # Dibujar el polígono
+        final_label = f"{base_label}{label_suffix}"
+        # closed=True es el default para Polygon, pero lo ponemos explícito
+        poly = patches.Polygon(vertices, closed=True, facecolor=color, edgecolor='black', hatch=hatch)
+        ax.add_patch(poly)
+
+        # Añadir a leyenda si es la primera vez que vemos este tipo/material/estado
+        if final_label not in legend_handles:
+             legend_handles[final_label] = poly # Guardar el patch para la leyenda
+
+        # Anotar CDG original de la parte (siempre sobre la geometría original, si no es visualización homog.)
+        # y si la forma tiene las propiedades cg_x, cg_y
+        if not homogenize_visual and hasattr(shape, 'cg_x') and hasattr(shape, 'cg_y'):
+             try:
+                 ax.plot(shape.cg_x, shape.cg_y, 'ko', markersize=3, label='_nolegend_') # k=black, o=circle, no en leyenda
+             except Exception as e:
+                 print(f"Advertencia: No se pudo dibujar CDG para {type(shape)}: {e}")
+
+
+    # --- Configurar límites y aspecto del gráfico ---
+
+    # Usar límites proporcionados si existen
+    if xlims is not None:
+        ax.set_xlim(xlims)
+    elif all_vertices_plot: # Auto-escala X si no se proporcionan límites y hay vértices
+        all_x = [v[0] for v in all_vertices_plot]
+        min_x, max_x = min(all_x), max(all_x)
+        delta_x = max(max_x - min_x, 10)
+        margin_x = delta_x * 0.15 + 10 # Margen ajustado
+        ax.set_xlim(min_x - margin_x, max_x + margin_x)
+    else:
+        ax.set_xlim(-100, 100) # Default si no hay vértices ni límites
+
+    if ylims is not None:
+        ax.set_ylim(ylims)
+    elif all_vertices_plot: # Auto-escala Y si no se proporcionan límites y hay vértices
+        all_y = [v[1] for v in all_vertices_plot]
+        min_y, max_y = min(all_y), max(all_y)
+        delta_y = max(max_y - min_y, 10)
+        margin_y = delta_y * 0.15 + 10 # Margen ajustado
+        ax.set_ylim(min_y - margin_y, max_y + margin_y)
+    else:
+        ax.set_ylim(-100, 100) # Default
+
+    # Dibujar centroide global resaltado si se proporciona
+    if highlight_centroid and isinstance(highlight_centroid, dict) and 'x' in highlight_centroid and 'y' in highlight_centroid:
+        try:
+            cx, cy = highlight_centroid['x'], highlight_centroid['y']
+            # Usar un marcador distinto y color llamativo
+            marker_style = 'X' # 'X' o 'P' (plus) son visibles
+            marker_color = 'red'
+            marker_size = 8 # Reducir tamaño ligeramente
+            marker = ax.plot(cx, cy, marker=marker_style, color=marker_color, markersize=marker_size, linestyle='None', label=centroid_label)[0]
+            # Añadir texto cerca del marcador
+            ax.text(cx, cy, f'  {centroid_label}', color=marker_color, va='bottom', ha='left', fontsize=8, fontweight='bold') # Fuente más pequeña
+            # Añadir a la leyenda si no estaba ya (poco probable con etiqueta única)
+            if centroid_label not in legend_handles:
+                 legend_handles[centroid_label] = marker
+        except Exception as e:
+            print(f"Advertencia: No se pudo dibujar el centroide resaltado ({centroid_label}): {e}")
+
+
+    # Configuración final del plot
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel("Coordenada X (mm)")
+    ax.set_ylabel("Coordenada Y (mm)")
+    ax.set_title(title, fontsize=10, fontweight='bold') # Fuente más pequeña para el título
+    ax.grid(True, linestyle=':', linewidth=0.5, color='gray', alpha=0.7) # Estilo de rejilla más sutil
+    # Crear leyenda única a partir de los handles guardados
+    if legend_handles:
+         ax.legend(legend_handles.values(), legend_handles.keys(), loc='best', fontsize=8) # Leyenda más pequeña
+
+    # Devolver la figura de matplotlib
+    return fig
+
+## FILE: main_app.py
+# main_app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math # Necesario para RotatedSteelPlate
+import locale # Para formato de fecha
+from datetime import datetime # Para fecha
+
+# Importaciones (asumiendo estructura de carpetas correcta)
+# Intentar importaciones relativas si se ejecuta como módulo, si no, directas.
+try:
+    from .core.materials import calculate_ecm_ec2, get_modular_ratio, DEFAULT_ES
+    from .core.section_analysis import calculate_section_properties
+    from .core.stress_analysis import calculate_navier_stress # NUEVO
+    from .core.classification_ec3 import classify_section_ec3 # NUEVO
+    from .shapes.steel_plate import SteelPlate # Chapa original (alineada con ejes)
+    from .shapes.concrete_trapezoid import ConcreteTrapezoid
+    from .shapes.rotated_steel_plate import RotatedSteelPlate # ¡Nueva clase!
+    from .visualization.plot_section import plot_section
+except ImportError:
+    # Fallback si se ejecuta como script simple (streamlit run main_app.py)
+    from core.materials import calculate_ecm_ec2, get_modular_ratio, DEFAULT_ES
+    from core.section_analysis import calculate_section_properties
+    from core.stress_analysis import calculate_navier_stress # NUEVO
+    from core.classification_ec3 import classify_section_ec3 # NUEVO
+    from shapes.steel_plate import SteelPlate # Chapa original (alineada con ejes)
+    from shapes.concrete_trapezoid import ConcreteTrapezoid
+    from shapes.rotated_steel_plate import RotatedSteelPlate # ¡Nueva clase!
+    from visualization.plot_section import plot_section
+
+
+# Configuración de la página de Streamlit
+st.set_page_config(
+    page_title="Análisis de Secciones Mixtas",
+    page_icon="🏗️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- Estado de la Sesión ---
+# Inicializar listas de formas si no existen
+if 'shapes' not in st.session_state:
+    st.session_state.shapes = []
+if 'undo_stack' not in st.session_state:
+     st.session_state.undo_stack = [] # Para posible función de deshacer
+# Inicializar estado de edición si no existe
+if 'editing_index' not in st.session_state:
+     st.session_state.editing_index = None
+# Inicializar estado para resultados de análisis (para que persistan si no se recalcula)
+if 'stress_results' not in st.session_state:
+     st.session_state.stress_results = None
+if 'classification_results' not in st.session_state:
+     st.session_state.classification_results = None
+if 'last_analysis_inputs' not in st.session_state:
+     st.session_state.last_analysis_inputs = {} # Guardar N, M, fy usados
+
+
+# --- Funciones Auxiliares ---
+def add_shape(shape_object):
+    """Añade una forma a la lista y guarda el estado anterior para deshacer."""
+    current_shapes_copy = [s for s in st.session_state.shapes]
+    st.session_state.undo_stack.append(current_shapes_copy)
+    max_undo = 10
+    if len(st.session_state.undo_stack) > max_undo: st.session_state.undo_stack.pop(0)
+    st.session_state.shapes.append(shape_object)
+    # Limpiar resultados de análisis al modificar la geometría
+    st.session_state.stress_results = None
+    st.session_state.classification_results = None
+
+def update_shape(index, updated_shape_object):
+    """Actualiza una forma en la lista y guarda el estado anterior para deshacer."""
+    if 0 <= index < len(st.session_state.shapes):
+        current_shapes_copy = [s for s in st.session_state.shapes]
+        st.session_state.undo_stack.append(current_shapes_copy)
+        max_undo = 10
+        if len(st.session_state.undo_stack) > max_undo: st.session_state.undo_stack.pop(0)
+        st.session_state.shapes[index] = updated_shape_object
+        # Limpiar resultados de análisis al modificar la geometría
+        st.session_state.stress_results = None
+        st.session_state.classification_results = None
+    else:
+        st.error(f"Índice de edición {index} fuera de rango.")
+
+def delete_shape(index):
+    """Elimina una forma de la lista y guarda el estado anterior para deshacer."""
+    if 0 <= index < len(st.session_state.shapes):
+        current_shapes_copy = [s for s in st.session_state.shapes]
+        st.session_state.undo_stack.append(current_shapes_copy)
+        max_undo = 10
+        if len(st.session_state.undo_stack) > max_undo: st.session_state.undo_stack.pop(0)
+        st.session_state.shapes.pop(index)
+         # Limpiar resultados de análisis al modificar la geometría
+        st.session_state.stress_results = None
+        st.session_state.classification_results = None
+        return True
+    else:
+        st.error(f"Índice de borrado {index} fuera de rango.")
+        return False
+
+def undo_last_action():
+    """Restaura el estado anterior de las formas."""
+    if st.session_state.undo_stack:
+        previous_shapes = st.session_state.undo_stack.pop()
+        st.session_state.shapes = previous_shapes
+        st.session_state.editing_index = None # Cancelar edición al deshacer
+         # Limpiar resultados de análisis al deshacer cambio geométrico
+        st.session_state.stress_results = None
+        st.session_state.classification_results = None
+        st.success("Última acción deshecha.")
+        st.rerun()
+    else:
+        st.warning("No hay acciones que deshacer.")
+
+# --- Interfaz Principal ---
+st.title("📊 Analizador de Secciones Mixtas")
+st.write("Herramienta para calcular propiedades geométricas, tensiones y clasificación de secciones compuestas Hormigón-Acero.")
+st.write("*(Homogeneización: Hormigón transformado a Acero equivalente)*")
+
+
+# --- Columnas para layout ---
+col_input, col_results = st.columns([1, 1.5])
+
+# --- Columna de Entrada ---
+with col_input:
+    st.header("🏗️ Definición de la Sección")
+    # ... (Materiales - sin cambios, pero guardamos n_display) ...
+    # ... (Geometría: Añadir / Editar Componentes - sin cambios funcionales) ...
+    # ... (Lista de Componentes Actuales - sin cambios funcionales) ...
+    # ... (Botón Apilar Chapa y Deshacer - sin cambios funcionales) ...
+
+    # --- SECCIÓN: Acciones y Parámetros de Análisis ---
+    st.header("⚙️ Acciones y Análisis")
+    with st.container(border=True):
+        st.subheader("Solicitaciones (ELU/ELS)")
+        # Guardar valores en session_state para que no se pierdan al añadir/editar formas
+        last_N = st.session_state.last_analysis_inputs.get('N', 0.0)
+        last_M = st.session_state.last_analysis_inputs.get('M', 100.0)
+        last_fy = st.session_state.last_analysis_inputs.get('fy', 235.0)
+
+        N_ed_kn = st.number_input("Axil, $N_{Ed}$ [kN]", value=last_N, format="%.2f",
+                                  key="N_ed_input", help="Positivo = Tracción, Negativo = Compresión")
+        Mx_ed_knm = st.number_input("Momento Flector, $M_{x,Ed}$ [kN·m]", value=last_M, format="%.2f",
+                                   key="Mx_ed_input", help="Convenio: Positivo comprime fibras superiores.")
+
+        st.subheader("Propiedades Acero (Clasificación)")
+        fy = st.number_input("Límite Elástico Acero, $f_y$ [MPa]", min_value=200.0, max_value=600.0, value=last_fy, step=5.0, key="fy_input")
+
+        run_analysis = st.button("🚀 Calcular Tensiones y Clasificar Sección", type="primary", use_container_width=True,
+                                 disabled=not st.session_state.shapes) # Solo deshabilitar si no hay formas
+
+        # Guardar los inputs si se ejecuta el análisis
+        if run_analysis:
+             st.session_state.last_analysis_inputs = {'N': N_ed_kn, 'M': Mx_ed_knm, 'fy': fy}
+
+
+# --- Columna de Resultados ---
+with col_results:
+    st.header("📊 Resultados del Análisis")
+
+    # --- Cálculo y Visualización de Propiedades ---
+    props_homog = None # Inicializar
+    n = 0 # Inicializar
+    n_display = "N/A" # Inicializar
+    if st.session_state.shapes:
+        try:
+            # Recalcular n aquí por si cambió fck
+            n = get_modular_ratio(fck, Es)
+            if n == float('inf') or n <= 0:
+                st.error(f"Relación modular n inválida ({n:.2f}). Verifique fck. No se pueden realizar análisis.")
+                n_display = "Inválido"
+            else:
+                n_display = f"{n:.2f}"
+                props_orig = calculate_section_properties(st.session_state.shapes, homogenize=False)
+                props_homog = calculate_section_properties(st.session_state.shapes, homogenize=True, modular_ratio=n)
+
+                st.subheader("📈 Propiedades Geométricas")
+                # ... (código de la tabla de propiedades, usando props_orig y props_homog) ...
+                def format_num(value, precision=2, is_area=False, is_inertia=False):
+                    try:
+                        num = float(value)
+                        if is_inertia: return f"{num:,.{precision}e} mm⁴"
+                        unit = " mm²" if is_area else " mm"
+                        return f"{num:,.{precision}f}{unit}"
+                    except: return str(value) if value is not None else "Error"
+                data = {
+                    'Propiedad': ['Área Total (A)', 'Centroide X (Xg)', 'Centroide Y (Yg)', 'Inercia Ix (CDG)', 'Inercia Iy (CDG)'],
+                    'Sección Original': [
+                        format_num(props_orig['total_area'], precision=1, is_area=True), format_num(props_orig['centroid_x']), format_num(props_orig['centroid_y']),
+                        format_num(props_orig.get('inertia_x'), precision=3, is_inertia=True) if props_orig.get('inertia_x') else "N/A",
+                        format_num(props_orig.get('inertia_y'), precision=3, is_inertia=True) if props_orig.get('inertia_y') else "N/A"
+                    ],
+                    'Sección Homogeneizada (a Acero)': [
+                        f"{format_num(props_homog['total_area'], precision=1, is_area=True)} (eq. Acero)", f"{format_num(props_homog['centroid_x'])}", f"{format_num(props_homog['centroid_y'])}",
+                        f"{format_num(props_homog.get('inertia_x'), precision=3, is_inertia=True)} (eq. Acero)" if props_homog.get('inertia_x') else "N/A",
+                        f"{format_num(props_homog.get('inertia_y'), precision=3, is_inertia=True)} (eq. Acero)" if props_homog.get('inertia_y') else "N/A"
+                    ]
+                }
+                df_results = pd.DataFrame(data)
+                st.dataframe(df_results, hide_index=True, use_container_width=True)
+
+
+                st.subheader("🖼️ Visualización Sección")
+                # ... (código de cálculo de límites y gráficos lado a lado, usando props_orig y props_homog) ...
+                # --- Calcular límites consistentes basados en geometría ORIGINAL ---
+                plot_xlims, plot_ylims = None, None # Defaults
+                all_orig_vertices = []
+                for shape in st.session_state.shapes:
+                    try:
+                        all_orig_vertices.extend(shape.get_vertices(width_scale_factor=1.0))
+                    except Exception as e:
+                        st.warning(f"No se pudieron obtener vértices de {type(shape)} para límites: {e}")
+                if all_orig_vertices:
+                     all_x = [v[0] for v in all_orig_vertices]; all_y = [v[1] for v in all_orig_vertices]
+                     all_x.append(0); all_y.append(0) # Incluir origen
+                     global_min_x, global_max_x = min(all_x), max(all_x)
+                     global_min_y, global_max_y = min(all_y), max(all_y)
+                     delta_x = max(global_max_x - global_min_x, 20); delta_y = max(global_max_y - global_min_y, 20)
+                     margin_x = delta_x * 0.15 + 10; margin_y = delta_y * 0.15 + 10
+                     plot_xlims = (global_min_x - margin_x, global_max_x + margin_x)
+                     plot_ylims = (global_min_y - margin_y, global_max_y + margin_y)
+                # --- Fin del cálculo de límites ---
+                # --- Mostrar Plots usando los límites calculados ---
+                plot_col1, plot_col2 = st.columns(2)
+                with plot_col1:
+                     st.write("**Sección Original**"); st.caption("CDG Original marcado en rojo.")
+                     try:
+                         fig_orig = plot_section(st.session_state.shapes, title="Sección Original",
+                                                 highlight_centroid={'x': props_orig['centroid_x'], 'y': props_orig['centroid_y']},
+                                                 centroid_label="CDG Orig.", xlims=plot_xlims, ylims=plot_ylims)
+                         st.pyplot(fig_orig, use_container_width=True)
+                     except Exception as plot_err: st.error(f"Err Graf Orig: {plot_err}")
+                with plot_col2:
+                     st.write(f"**Visual. Homogeneizada**"); st.caption(f"Hormigón (ancho/{n_display}). CDG Homog. en rojo.")
+                     try:
+                         fig_homog_vis = plot_section(st.session_state.shapes, title="Visual. Homog. (H->A)",
+                                                      homogenize_visual=True, modular_ratio=n,
+                                                      highlight_centroid={'x': props_homog['centroid_x'], 'y': props_homog['centroid_y']},
+                                                      centroid_label="CDG Homog.", xlims=plot_xlims, ylims=plot_ylims)
+                         st.pyplot(fig_homog_vis, use_container_width=True)
+                     except Exception as plot_err: st.error(f"Err Graf Homog: {plot_err}")
+
+        except Exception as e:
+            st.error(f"Error en cálculo/visualización de propiedades: {e}")
+            props_homog = None # Resetear si falla
+
+    else: # Si no hay formas
+         st.info("Añada componentes geométricos para ver los resultados.")
+         props_homog = None # Asegurar que es None si no hay formas
+
+
+    # --- SECCIÓN: Resultados de Tensiones y Clasificación ---
+    st.markdown("---")
+    st.header("🔬 Tensiones y Clasificación")
+
+    # Realizar análisis si se pulsó el botón Y las props están disponibles Y n es válido
+    if run_analysis:
+        if props_homog and n > 0:
+            # Recuperar inputs usados para este análisis
+            N_ed_kn = st.session_state.last_analysis_inputs.get('N', 0.0)
+            Mx_ed_knm = st.session_state.last_analysis_inputs.get('M', 0.0)
+            fy = st.session_state.last_analysis_inputs.get('fy', 0.0)
+
+            # Convertir unidades
+            N_ed_N = N_ed_kn * 1000.0
+            Mx_ed_Nmm = Mx_ed_knm * 1000.0 * 1000.0
+
+            # Calcular tensiones y guardar en session state
+            st.session_state.stress_results = calculate_navier_stress(N_ed_N, Mx_ed_Nmm, st.session_state.shapes, props_homog)
+
+            # Calcular clasificación y guardar en session state
+            y_na_for_class = st.session_state.stress_results.get('y_na') if st.session_state.stress_results else None
+            st.session_state.classification_results = classify_section_ec3(st.session_state.shapes, y_na_for_class, fy)
+        else:
+            # Limpiar resultados si no se puede calcular
+            st.session_state.stress_results = None
+            st.session_state.classification_results = None
+            if not props_homog: st.error("No se pudieron calcular propiedades homogeneizadas.")
+            if n <= 0: st.error("Relación modular inválida.")
+
+
+    # --- Mostrar resultados del análisis (si existen en session_state) ---
+    if st.session_state.stress_results:
+        stress_results = st.session_state.stress_results
+        if stress_results['error']:
+            st.error(f"Error al calcular tensiones: {stress_results['error']}")
+        else:
+            st.subheader("⚡ Tensiones Elásticas (Navier)")
+            y_na_calc = stress_results['y_na']
+            if y_na_calc is None: st.write("Fibra Neutra (y_NA): Indeterminada.")
+            elif y_na_calc == float('inf') or y_na_calc == float('-inf'): st.write("Fibra Neutra (y_NA): En el infinito.")
+            else: st.write(f"Fibra Neutra (y_NA): {y_na_calc:.2f} mm")
+
+            st.write("**Tensiones (Acero Equivalente y Real):**")
+            stress_data = []; max_s_steel = -float('inf'); min_s_steel = float('inf')
+            max_s_conc = -float('inf'); min_s_conc = float('inf')
+            for key, data in stress_results['stresses'].items():
+                 sigma_eq = data['sigma_eq']
+                 is_concrete = data['mat'] == 'concrete'
+                 sigma_real = sigma_eq / n if is_concrete and n > 0 else sigma_eq
+                 stress_data.append({
+                     "Comp.#": key.split('_')[1], "Punto": "ymin" if "ymin" in key else "ymax",
+                     "Y (mm)": f"{data['y']:.1f}", "σ Eq [MPa]": f"{sigma_eq:.1f}",
+                     "σ Real [MPa]": f"{sigma_real:.1f}", "Mat.": "H" if is_concrete else "A"
+                 })
+                 if is_concrete: max_s_conc, min_s_conc = max(max_s_conc, sigma_real), min(min_s_conc, sigma_real)
+                 else: max_s_steel, min_s_steel = max(max_s_steel, sigma_real), min(min_s_steel, sigma_real)
+            if stress_data:
+                 df_stress = pd.DataFrame(stress_data)
+                 st.dataframe(df_stress, hide_index=True, use_container_width=True, height=200) # Limitar altura
+                 st.write("**Resumen $\sigma$ Reales:**")
+                 st.markdown(f"- Acero: *Min* {min_s_steel:.1f} MPa, *Max* {max_s_steel:.1f} MPa")
+                 # Solo mostrar hormigón si existe
+                 if any(s['mat'] == 'concrete' for s in stress_results['stresses'].values()):
+                      st.markdown(f"- Hormigón: *Min* {min_s_conc:.1f} MPa, *Max* {max_s_conc:.1f} MPa")
+            else: st.write("No se calcularon puntos de tensión.")
+
+    if st.session_state.classification_results:
+        classification_results = st.session_state.classification_results
+        st.subheader("🔢 Clasificación Sección (EC3/EC4 - Simplificada)")
+        st.write(f"**Clase Global de la Sección: {classification_results['overall_class']}**")
+        st.write("**Clasificación por elemento de acero:**")
+        class_data = [{"Comp. Acero #": k.split('_')[-1], "Clase": v} for k, v in classification_results['element_classes'].items()]
+        if class_data: st.dataframe(pd.DataFrame(class_data), hide_index=True, use_container_width=True)
+        else: st.write("No hay elementos de acero para clasificar.")
+        if classification_results['warnings']:
+             st.warning("Advertencias durante la clasificación:")
+             for warn in classification_results['warnings']: st.warning(f"- {warn}")
+
+    # Mensaje si no se ha ejecutado el análisis todavía
+    if not st.session_state.stress_results and not st.session_state.classification_results:
+         st.info("Introduzca las acciones y pulse 'Calcular Tensiones y Clasificar Sección'.")
+
+
+# --- Pié de Página o Sidebar (Actualizar versión) ---
+st.sidebar.header("Acerca de")
+st.sidebar.info(
+    f"""
+    **Analizador de Secciones Mixtas v0.6**
+
+    Calcula propiedades geométricas, tensiones (Navier) y clasificación
+    simplificada (EC3/EC4@{st.session_state.last_analysis_inputs.get('fy', 'N/A')} MPa) de secciones compuestas.
+    - Homogeneización: Hormigón -> Acero (Prop. / n={n_display}).
+    - Visualización: Original y Homogeneizada (lado a lado, escala común).
+    - Edición, Apilado Básico y Deshacer.
+    """
+)
+st.sidebar.markdown("---")
+# Actualizar fecha/lugar dinámicamente
+try:
+     locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
+except locale.Error:
+     try: locale.setlocale(locale.LC_TIME, 'es_ES')
+     except locale.Error: print("Locale 'es_ES' no disponible, usando default."); pass
+now = datetime.now()
+current_date_str = now.strftime("%A, %d de %B de %Y - %H:%M:%S") # Añadir segundos
+st.sidebar.markdown(f"*{current_date_str} (Cáceres, España)*")
+# Mostrar versiones de librerías clave
+try:
+    import streamlit as st_ver; sv = st_ver.__version__
+    import pandas as pd_ver; pv = pd_ver.__version__
+    import matplotlib as mpl_ver; mv = mpl_ver.__version__
+    import numpy as np_ver; nv = np_ver.__version__
+    st.sidebar.caption(f"Streamlit v{sv} | Pandas v{pv} | Matplotlib v{mv} | Numpy v{nv}")
+except Exception: pass # Evitar error si algo no está importado
