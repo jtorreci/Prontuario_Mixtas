@@ -37,7 +37,6 @@ def get_element_class(ratio_ct, epsilon, element_type="internal"):
 def classify_section_ec3(shapes, y_na, fy):
     """
     Realiza una clasificación SIMPLIFICADA de elementos de acero según EC3.
-
     Args:
         shapes (list): Lista de objetos de forma (SteelPlate, RotatedSteelPlate).
         y_na (float or None): Posición de la fibra neutra. Infinito si solo axil. None si sin tensiones.
@@ -87,7 +86,6 @@ def classify_section_ec3(shapes, y_na, fy):
                     # Si M>0 (comprime arriba) y N=0, y_NA=y_G -> parte >y_G comprimida
                     # Si M>0 y N<0 (compresión), y_NA > y_G -> parte >y_NA comprimida
                     # Si M>0 y N>0 (tracción), y_NA < y_G -> parte >y_G comprimida
-                    # Es complejo determinar la zona exacta sin las tensiones sigma_min/max
 
                     # Simplificación GROSERA: Si la FN corta, asumimos compresión y usamos la peor clase
                     # calculada como alma o ala, usando dimensiones totales. ¡Muy conservador!
@@ -99,34 +97,34 @@ def classify_section_ec3(shapes, y_na, fy):
                         w_dim = shape.width  # Dimensión X
                         # Heurística: Alma si H > W, Ala si W >= H
                         if h_dim > w_dim : # Alma vertical
-                             element_type = "internal"
-                             t = shape.width
-                             c = shape.height # Altura total comprimida (conservador)
+                            element_type = "internal"
+                            t = shape.width
+                            c = shape.height # Altura total comprimida (conservador)
                         else: # Ala horizontal
-                             element_type = "outstand"
-                             t = shape.height
-                             c = shape.width / 2 # Voladizo (conservador)
+                            element_type = "outstand"
+                            t = shape.height
+                            c = shape.width / 2 # Voladizo (conservador)
 
                     # --- Lógica simplificada para RotatedSteelPlate ---
                     elif isinstance(shape, RotatedSteelPlate):
-                         element_type = "outstand" # Suponer siempre ala? O tratar como alma?
-                         t = shape.t
-                         c = shape.L # Usar longitud total? Muy conservador
-                         results['warnings'].append(f"Clasificación Rotada {i+1} conservadora (c=L, t=t).")
+                        element_type = "outstand" # Suponer siempre ala? O tratar como alma?
+                        t = shape.t
+                        c = shape.L # Usar longitud total? Muy conservador
+                        results['warnings'].append(f"Clasificación Rotada {i+1} conservadora (c=L, t=t).")
 
                 # Caso: Todo comprimido (y_na <= y_min) - Requiere comprobar signo N o tensiones
                 # Caso: Todo traccionado (y_na >= y_max) - Clase 1
                 # Simplificación: Si y_na está fuera, asumimos que la compresión domina si y_na está abajo
                 elif y_na is not None and y_na <= y_min: # Potencialmente todo comprimido
-                     is_compressed = True # Necesitaría chequeo de N o sigma
-                     # Usar dimensiones totales como antes para ser conservador
-                     if isinstance(shape, SteelPlate):
-                          h_dim, w_dim = shape.height, shape.width
-                          if h_dim > w_dim: t, c, element_type = w_dim, h_dim, "internal"
-                          else: t, c, element_type = h_dim, w_dim / 2, "outstand"
-                     elif isinstance(shape, RotatedSteelPlate):
-                          t, c, element_type = shape.t, shape.L, "outstand" # Conservador
-                          results['warnings'].append(f"Clasificación Rotada {i+1} conservadora (c=L, t=t).")
+                    is_compressed = True # Necesitaría chequeo de N o sigma
+                    # Usar dimensiones totales como antes para ser conservador
+                    if isinstance(shape, SteelPlate):
+                        h_dim, w_dim = shape.height, shape.width
+                        if h_dim > w_dim: t, c, element_type = w_dim, h_dim, "internal"
+                        else: t, c, element_type = h_dim, w_dim / 2, "outstand"
+                    elif isinstance(shape, RotatedSteelPlate):
+                        t, c, element_type = shape.t, shape.L, "outstand" # Conservador
+                    results['warnings'].append(f"Clasificación Rotada {i+1} conservadora (c=L, t=t).")
 
             # Si solo hay axil de compresión (y_na = +/- inf), todo está comprimido
             # Necesitaríamos N_ed aquí para saber el signo. Omitimos este caso por ahora.
@@ -139,14 +137,14 @@ def classify_section_ec3(shapes, y_na, fy):
                 # Sobrescribir a Clase 1 si está conectado a hormigón (NO IMPLEMENTADO)
                 # if is_connected_to_concrete(shape): shape_class = 1
             else:
-                 shape_class = 1 # Si no está comprimido o espesor nulo
+                shape_class = 1 # Si no está comprimido o espesor nulo
 
         except AttributeError:
             results['warnings'].append(f"Forma {i+1} ({type(shape)}) sin props. y_min/y_max para clasificación.")
             shape_class = 4 # Clase desconocida o no analizable -> pesimista
         except Exception as e:
-             results['warnings'].append(f"Error clasificando forma {i+1}: {e}")
-             shape_class = 4
+            results['warnings'].append(f"Error clasificando forma {i+1}: {e}")
+            shape_class = 4
 
         results['element_classes'][element_key] = shape_class
         if shape_class > max_class:

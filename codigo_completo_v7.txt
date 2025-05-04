@@ -1,0 +1,646 @@
+## FILE: requirements.txt
+streamlit
+numpy
+matplotlib
+pandas
+tabulate
+
+## FILE: core/__init__.py
+# Este archivo está vacío, pero es necesario para que Python reconozca 'core' como un paquete.
+
+## FILE: core/materials.py
+# core/materials.py
+import math
+
+DEFAULT_ES = 210000.0  # Módulo de Young del acero (MPa) - Usar 200000 o 210000 según norma aplicable
+
+def calculate_ecm_ec2(fck):
+    """Calcula el módulo de elasticidad secante del hormigón según EC2 (MPa)."""
+    if fck <= 0:
+        return 0
+    # Fórmula Ecm = 22 * (fcm / 10)^0.3, donde fcm = fck + 8
+    fcm = fck + 8
+    ecm = 22000 * math.pow(fcm / 10, 0.3)
+    return ecm
+
+def get_modular_ratio(fck, Es=DEFAULT_ES):
+    """Calcula la relación modular n = Es / Ecm."""
+    Ecm = calculate_ecm_ec2(fck)
+    if Ecm <= 1e-9: # Evitar división por cero o valores muy pequeños
+        # Considerar lanzar un error o devolver infinito/un valor muy grande
+        print(f"Advertencia: Ecm calculado es muy bajo ({Ecm:.2f}) para fck={fck}. La relación modular será muy alta.")
+        return float('inf')
+    return Es / Ecm
+
+## FILE: core/analysis/__init__.py
+# Este archivo puede estar vacío.
+# Su presencia indica a Python que 'analysis' es un paquete.
+
+## FILE: core/analysis/section_analysis.py
+# core/analysis/section_analysis.py
+import numpy as np
+
+class SectionPropertiesCalculator:
+    """Calcula las propiedades geométricas de una sección."""
+
+    def __init__(self, shapes, homogenize=False, modular_ratio=None):
+        self.shapes = shapes
+        self.homogenize = homogenize
+        self.modular_ratio = modular_ratio
+        self.total_area = 0.0
+        self.moment_x = 0.0
+        self.moment_y = 0.0
+        self.inertia_x_global = 0.0
+        self.inertia_y_global = 0.0
+        self.processed_shapes = []
+
+        self._validate_inputs()
+
+    def _validate_inputs(self):
+        if self.homogenize and self.modular_ratio is None:
+            raise ValueError("Se requiere 'modular_ratio' para homogeneizar.")
+        if self.homogenize and self.modular_ratio <= 0:
+            raise ValueError("'modular_ratio' debe ser positivo para homogeneizar.")
+
+    def _process_shape(self, shape):
+        try:
+            A = shape.area
+            x = shape.cg_x
+            y = shape.cg_y
+            Ix_local = shape.inertia_x_local
+            Iy_local = shape.inertia_y_local if hasattr(shape, 'inertia_y_local') and shape.inertia_y_local is not None else 0.0
+        except AttributeError as e:
+            raise AttributeError(f"El objeto {type(shape)} no tiene una propiedad necesaria: {e}")
+
+        if self.homogenize and hasattr(shape, 'material') and shape.material == "concrete":
+            if self.modular_ratio == 0:
+                raise ValueError("Intento de división por cero en homogeneización (modular_ratio=0).")
+            A /= self.modular_ratio
+            Ix_local /= self.modular_ratio
+            Iy_local /= self.modular_ratio  # Precaución con esta simplificación para Iy
+
+        if abs(A) > 1e-9:
+            self.processed_shapes.append({'A': A, 'x': x, 'y': y, 'Ix': Ix_local, 'Iy': Iy_local})
+            self.total_area += A
+            self.moment_x += A * y
+            self.moment_y += A * x
+
+    def calculate_properties(self):
+        for shape in self.shapes:
+            self._process_shape(shape)
+
+        if abs(self.total_area) < 1e-9:
+            return {'total_area': 0, 'centroid_x': 0, 'centroid_y': 0, 'inertia_x': 0, 'inertia_y': 0}
+
+        centroid_x = self.moment_y / self.total_area
+        centroid_y = self.moment_x / self.total_area
+
+        for props in self.processed_shapes:
+            dy = props['y'] - centroid_y
+            dx = props['x'] - centroid_x
+            self.inertia_x_global += props['Ix'] + props['A'] * dy**2
+            self.inertia_y_global += props['Iy'] + props['A'] * dx**2
+
+        return {
+            'total_area': self.total_area,
+            'centroid_x': centroid_x,
+            'centroid_y': centroid_y,
+            'inertia_x': self.inertia_x_global,
+            'inertia_y': self.inertia_y_global
+        }
+
+## FILE: core/analysis/stress_analysis.py
+# core/analysis/stress_analysis.py
+import numpy as np
+import logging
+
+class StressCalculator:
+    """Calcula tensiones elásticas y fibra neutra usando Navier."""
+
+    def __init__(self, shapes, homog_props, N_ed, Mx_ed):
+        """
+        Inicializa el calculador de tensiones.
+
+        Args:
+            shapes (list): Lista de objetos de forma originales.
+            homog_props (dict): Propiedades de la sección homogeneizada a acero
+                                {'total_area', 'centroid_y', 'inertia_x'}.
+            N_ed (float): Esfuerzo Axil (N). Positivo = Tracción, Negativo = Compresión.
+            Mx_ed (float): Momento Flector respecto a eje X centroidal (N·mm).
+                           Convenio: Positivo comprime fibras superiores (y > y_G).
+        """
+        self.shapes = shapes
+        self.homog_props = homog_props
+        self.N_ed = N_ed
+        self.Mx_ed = Mx_ed
+        self.A_h = homog_props.get('total_area')
+        self.Iy_h = homog_props.get('inertia_x')
+        self.y_G = homog_props.get('centroid_y')
+        self.results = {'y_na': None, 'stresses': {}, 'error': None}
+
+    def _validate_inputs(self):
+        """Valida las propiedades de la sección homogeneizada."""
+
+        if any(prop is None for prop in (self.A_h, self.Iy_h, self.y_G)):
+            self.results['error'] = "Faltan propiedades homogeneizadas (A, Ix, yG)."
+            return False
+
+        if abs(self.A_h) < 1e-9:
+            self.results['error'] = "Área homogeneizada es prácticamente cero."
+            return False
+
+        if abs(self.Iy_h) < 1e-9 and abs(self.Mx_ed) > 1e-9:
+            self.results['error'] = "Inercia X homogeneizada nula con momento aplicado."
+            return False
+
+        return True
+
+    def _calculate_axial_stress(self):
+        """Calcula la tensión debida al esfuerzo axil."""
+
+        return self.N_ed / self.A_h if self.A_h != 0 else 0
+
+    def _calculate_neutral_axis(self, sigma_axial):
+        """Calcula la posición de la fibra neutra."""
+
+        if abs(self.Mx_ed) > 1e-9:
+            try:
+                y_na = self.y_G + (self.N_ed * self.Iy_h) / (self.Mx_ed * self.A_h)
+                self.results['y_na'] = y_na
+            except ZeroDivisionError:
+                self.results['error'] = "División por cero al calcular y_NA (A o M pueden ser cero)."
+                return False
+        elif abs(self.N_ed) < 1e-9:  # Puro momento nulo o puro axil nulo -> Tensión cero
+            self.results['y_na'] = None  # Indicar que no aplica o está en infinito
+        else:  # Solo Axil (N_ed != 0, Mx_ed = 0)
+            self.results['y_na'] = float('inf') if self.N_ed != 0 else None  # Fibra neutra en infinito
+        return True
+
+    def _calculate_stresses_at_points(self, sigma_axial):
+        """Calcula las tensiones en los puntos clave de cada forma."""
+
+        stresses = {}
+        for i, shape in enumerate(self.shapes):
+            try:
+                y_min_shape = shape.y_min
+                y_max_shape = shape.y_max
+
+                sigma_min = sigma_axial
+                sigma_max = sigma_axial
+                if abs(self.Iy_h) > 1e-9:  # Solo añadir término de momento si la inercia no es nula
+                    sigma_min -= (self.Mx_ed / self.Iy_h) * (y_min_shape - self.y_G)
+                    sigma_max -= (self.Mx_ed / self.Iy_h) * (y_max_shape - self.y_G)
+
+                stresses[f'shape_{i + 1}_ymin'] = {'y': y_min_shape, 'sigma_eq': sigma_min, 'mat': shape.material}
+                stresses[f'shape_{i + 1}_ymax'] = {'y': y_max_shape, 'sigma_eq': sigma_max, 'mat': shape.material}
+
+            except AttributeError:
+                logging.warning(f"Forma {i + 1} ({type(shape)}) no tiene y_min/y_max, no se calculan tensiones.")
+            except Exception as e:
+                logging.error(f"Error calculando tensiones para forma {i + 1}: {e}")
+                self.results['error'] = f"Error calculando tensión en forma {i + 1}."
+        self.results['stresses'] = stresses
+
+    def calculate_stresses(self):
+        """
+        Calcula las tensiones elásticas y la fibra neutra.
+
+        Returns:
+            dict: Contiene 'y_na' (posición fibra neutra), 'stresses' (dict con tensiones
+                  en puntos clave), 'error' (mensaje de error si lo hay).
+        """
+
+        if not self._validate_inputs():
+            return self.results
+
+        sigma_axial = self._calculate_axial_stress()
+
+        if not self._calculate_neutral_axis(sigma_axial):
+            return self.results
+
+        self._calculate_stresses_at_points(sigma_axial)
+
+        return self.results
+
+## FILE: core/classification_ec3.py
+# core/classification_ec3.py
+import math
+
+# Límites c/t de EC3 Tabla 5.2 para clases (simplificado, usando valores para S235)
+# Estos deberían ajustarse con epsilon = sqrt(235/fy)
+# Usaremos límites conservadores (compresión pura) inicialmente para simplificar
+
+# Límites para alas a compresión (Outstand flanges) - Compresión Pura
+CLASS_LIMITS_FLANGE_COMP = {
+    1: 9.0,
+    2: 10.0,
+    3: 14.0,
+}
+# Límites para almas a compresión (Internal compression parts) - Compresión Pura
+CLASS_LIMITS_WEB_COMP = {
+    1: 33.0,
+    2: 38.0,
+    3: 42.0,
+}
+
+def get_element_class(ratio_ct, epsilon, element_type="internal"):
+    """Clasifica un elemento basado en c/t, epsilon y tipo."""
+    if element_type == "outstand":
+        limits = CLASS_LIMITS_FLANGE_COMP
+    else: # internal (web)
+        limits = CLASS_LIMITS_WEB_COMP
+
+    if ratio_ct <= limits[1] * epsilon:
+        return 1
+    elif ratio_ct <= limits[2] * epsilon:
+        return 2
+    elif ratio_ct <= limits[3] * epsilon:
+        return 3
+    else:
+        return 4
+
+def classify_section_ec3(shapes, y_na, fy):
+    """
+    Realiza una clasificación SIMPLIFICADA de elementos de acero según EC3.
+    Args:
+        shapes (list): Lista de objetos de forma (SteelPlate, RotatedSteelPlate).
+        y_na (float or None): Posición de la fibra neutra. Infinito si solo axil. None si sin tensiones.
+        fy (float): Límite elástico del acero (MPa).
+
+    Returns:
+        dict: Contiene 'element_classes' (dict con clase por elemento),
+              'overall_class' (clase global de la sección), 'warnings' (list).
+    """
+    results = {'element_classes': {}, 'overall_class': 1, 'warnings': []}
+    if fy <= 0:
+        results['warnings'].append("Fy inválido, no se puede calcular epsilon.")
+        return results # No podemos clasificar sin fy
+
+    epsilon = math.sqrt(235.0 / fy)
+    max_class = 0 # Empezamos asumiendo clase 1 (la más favorable)
+
+    for i, shape in enumerate(shapes):
+        # Solo clasificamos chapas de acero
+        if not hasattr(shape, 'material') or shape.material != "steel":
+            continue
+
+        element_key = f"steel_shape_{i+1}"
+        shape_class = 1 # Asumir clase 1 por defecto si no está comprimido o no se analiza
+        is_compressed = False # Flag para saber si alguna parte está comprimida
+
+        try:
+            y_min = shape.y_min
+            y_max = shape.y_max
+            t = 0.0 # Espesor
+            c = 0.0 # Dimensión 'c' relevante para pandeo
+            element_type = "internal" # Tipo por defecto
+
+            # Determinar si la chapa está (parcialmente) en compresión
+            # Necesitamos y_na. Si y_na es None o inf, la clasificación es diferente
+            # (p.ej., compresión uniforme si y_na=inf y N<0).
+            # Simplificación: si y_na es finito, asumimos flexión o flexo-compresión.
+            if isinstance(y_na, (int, float)):
+                # Asumimos compresión si la fibra neutra corta la pieza
+                if y_na < y_max and y_na > y_min:
+                    # Compresión parcial. Determinar la parte comprimida
+                    # Si y_na > cg_y -> parte superior comprimida (y_na a y_max)
+                    # Si y_na < cg_y -> parte inferior comprimida (y_min a y_na)
+                    # Esta lógica asume M+ comprime arriba, necesita ser consistente con Navier
+                    # Nuestro convenio Navier M+ comprime arriba (y>y_G)
+                    # Nuestro cálculo de y_NA es y_NA = y_G + N*I/(M*A)
+                    # Si M>0 (comprime arriba) y N=0, y_NA=y_G -> parte >y_G comprimida
+                    # Si M>0 y N<0 (compresión), y_NA > y_G -> parte >y_NA comprimida
+                    # Si M>0 y N>0 (tracción), y_NA < y_G -> parte >y_G comprimida
+
+                    # Simplificación GROSERA: Si la FN corta, asumimos compresión y usamos la peor clase
+                    # calculada como alma o ala, usando dimensiones totales. ¡Muy conservador!
+                    is_compressed = True
+
+                    # --- Lógica simplificada para SteelPlate ---
+                    if isinstance(shape, SteelPlate):
+                        h_dim = shape.height # Dimensión Y
+                        w_dim = shape.width  # Dimensión X
+                        # Heurística: Alma si H > W, Ala si W >= H
+                        if h_dim > w_dim : # Alma vertical
+                            element_type = "internal"
+                            t = shape.width
+                            c = shape.height # Altura total comprimida (conservador)
+                        else: # Ala horizontal
+                            element_type = "outstand"
+                            t = shape.height
+                            c = shape.width / 2 # Voladizo (conservador)
+
+                    # --- Lógica simplificada para RotatedSteelPlate ---
+                    elif isinstance(shape, RotatedSteelPlate):
+                        element_type = "outstand" # Suponer siempre ala? O tratar como alma?
+                        t = shape.t
+                        c = shape.L # Usar longitud total? Muy conservador
+                        results['warnings'].append(f"Clasificación Rotada {i+1} conservadora (c=L, t=t).")
+
+                # Caso: Todo comprimido (y_na <= y_min) - Requiere comprobar signo N o tensiones
+                # Caso: Todo traccionado (y_na >= y_max) - Clase 1
+                # Simplificación: Si y_na está fuera, asumimos que la compresión domina si y_na está abajo
+                elif y_na is not None and y_na <= y_min: # Potencialmente todo comprimido
+                    is_compressed = True # Necesitaría chequeo de N o sigma
+                    # Usar dimensiones totales como antes para ser conservador
+                    if isinstance(shape, SteelPlate):
+                        h_dim, w_dim = shape.height, shape.width
+                        if h_dim > w_dim: t, c, element_type = w_dim, h_dim, "internal"
+                        else: t, c, element_type = h_dim, w_dim / 2, "outstand"
+                    elif isinstance(shape, RotatedSteelPlate):
+                        t, c, element_type = shape.t, shape.L, "outstand" # Conservador
+                    results['warnings'].append(f"Clasificación Rotada {i+1} conservadora (c=L, t=t).")
+
+            # Si solo hay axil de compresión (y_na = +/- inf), todo está comprimido
+            # Necesitaríamos N_ed aquí para saber el signo. Omitimos este caso por ahora.
+
+
+            # Calcular clase si está comprimido y dimensiones válidas
+            if is_compressed and t > 1e-6:
+                ratio_ct = c / t
+                shape_class = get_element_class(ratio_ct, epsilon, element_type)
+                # Sobrescribir a Clase 1 si está conectado a hormigón (NO IMPLEMENTADO)
+                # if is_connected_to_concrete(shape): shape_class = 1
+            else:
+                shape_class = 1 # Si no está comprimido o espesor nulo
+
+        except AttributeError:
+            results['warnings'].append(f"Forma {i+1} ({type(shape)}) sin props. y_min/y_max para clasificación.")
+            shape_class = 4 # Clase desconocida o no analizable -> pesimista
+        except Exception as e:
+            results['warnings'].append(f"Error clasificando forma {i+1}: {e}")
+            shape_class = 4
+
+        results['element_classes'][element_key] = shape_class
+        if shape_class > max_class:
+            max_class = shape_class
+
+    # La clase global es la peor (más alta) de los elementos comprimidos
+    results['overall_class'] = max_class
+
+    # Advertencia sobre la no implementación de la regla EC4
+    results['warnings'].append("Regla EC4 (contacto ala-hormigón -> Clase 1) NO implementada.")
+    results['warnings'].append("Clasificación basada en heurística simple (alma/ala) y dimensiones totales comprimidas (conservador).")
+
+    return results
+
+## FILE: shapes/__init__.py
+# Este archivo está vacío, pero es necesario para que Python reconozca 'shapes' como un paquete.
+
+## FILE: shapes/steel_plate.py
+# shapes/steel_plate.py
+import numpy as np
+
+class SteelPlate:
+    """Representa una chapa de acero rectangular alineada con los ejes globales X,Y."""
+    def __init__(self, width, height, cg_x, cg_y):
+        self.width = float(width)   # Dimensión paralela al eje X
+        self.height = float(height) # Dimensión paralela al eje Y
+        self.cg_x = float(cg_x)
+        self.cg_y = float(cg_y)
+        self.material = "steel"
+
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("El ancho y alto de la chapa deben ser positivos.")
+
+    @property
+    def area(self):
+        return self.width * self.height
+
+    @property
+    def inertia_x_local(self):
+        """Inercia respecto al eje x que pasa por su CDG local (paralelo a X global)."""
+        # Eje horizontal por el centroide: b*h^3/12 -> width * height^3 / 12
+        return self.width * self.height**3 / 12
+
+    @property
+    def inertia_y_local(self):
+        """Inercia respecto al eje y que pasa por su CDG local (paralelo a Y global)."""
+        # Eje vertical por el centroide: h*b^3/12 -> height * width^3 / 12
+        return self.height * self.width**3 / 12
+
+    @property
+    def y_min(self):
+        return self.cg_y - self.height / 2
+    @property
+    def y_max(self):
+        return self.cg_y + self.height / 2
+    @property
+    def x_min(self):
+        return self.cg_x - self.width / 2
+    @property
+    def x_max(self):
+        return self.cg_x + self.width / 2
+
+    def get_vertices(self, width_scale_factor=1.0):
+        """
+        Devuelve las coordenadas de los 4 vértices para dibujar.
+        El 'width_scale_factor' solo afecta si se quisiera visualizar
+        la homogeneización de acero (normalmente no se hace).
+        Aquí escala la dimensión 'width' (paralela a X).
+        """
+        scaled_width = self.width * width_scale_factor
+        half_w = scaled_width / 2
+        half_h = self.height / 2 # La altura (paralela a Y) no se escala por defecto
+
+        return [
+            (self.cg_x - half_w, self.cg_y - half_h), # Bottom-left
+            (self.cg_x + half_w, self.cg_y - half_h), # Bottom-right
+            (self.cg_x + half_w, self.cg_y + half_h), # Top-right
+            (self.cg_x - half_w, self.cg_y + half_h)  # Top-left
+        ]
+
+## FILE: shapes/concrete_trapezoid.py
+# shapes/concrete_trapezoid.py
+import numpy as np
+
+class ConcreteTrapezoid:
+    """
+    Representa un trapecio de hormigón, definido por anchos inferior/superior,
+    altura y coordenadas del centro de la base inferior.
+    Se asume simetría vertical respecto al eje que pasa por el centro de la base inferior.
+    """
+    def __init__(self, bottom_width, top_width, height, bottom_center_x, bottom_center_y):
+        self.b1 = float(bottom_width)  # Ancho inferior
+        self.b2 = float(top_width)    # Ancho superior
+        self.h = float(height)
+        self.bc_x = float(bottom_center_x) # X del centro de la base inferior
+        self.bc_y = float(bottom_center_y) # Y del centro (y nivel) de la base inferior
+        self.material = "concrete"
+
+        if self.h <= 0:
+            raise ValueError("La altura del trapecio debe ser positiva.")
+        if self.b1 < 0 or self.b2 < 0:
+            raise ValueError("Los anchos del trapecio no pueden ser negativos.")
+
+    @property
+    def area(self):
+        return (self.b1 + self.b2) / 2 * self.h
+
+    @property
+    def cg_y_local(self):
+        """Distancia vertical del CDG a la base inferior."""
+        sum_b = self.b1 + self.b2
+        if abs(sum_b) < 1e-9: # Evitar división por cero si el área es 0 (b1=b2=0)
+            # Si el área es cero, el CDG está indefinido, pero podemos devolver la mitad de la altura
+            # o manejarlo como un caso especial. Devolver h/2 es razonable.
+            return self.h / 2
+        # Fórmula para la posición Y del Cdg respecto a la base inferior
+        return (self.h / 3) * (self.b1 + 2 * self.b2) / sum_b
+
+    @property
+    def cg_x(self):
+        """Coordenada X global del CDG (asume simetría respecto al eje vertical que pasa por bc_x)."""
+        # Para un trapecio isósceles (o definido simétricamente), el CDG está en el eje de simetría
+        return self.bc_x
+
+    @property
+    def cg_y(self):
+        """Coordenada Y global del CDG."""
+        return self.bc_y + self.cg_y_local
+
+    @property
+    def inertia_x_local(self):
+        """Inercia respecto al eje x que pasa por su CDG local (paralelo a X global)."""
+        sum_b = self.b1 + self.b2
+        if abs(sum_b) < 1e-9:
+            return 0 # Inercia cero si el área es cero
+        # Fórmula de la inercia de un trapecio respecto a su eje centroidal horizontal
+        return (self.h**3 / 36) * (self.b1**2 + 4 * self.b1 * self.b2 + self.b2**2) / sum_b
+
+    @property
+    def inertia_y_local(self):
+        """Inercia respecto al eje y que pasa por su CDG local (paralelo a Y global, asume simetría)."""
+        # Fórmula para trapecio simétrico respecto al eje vertical centroidal
+        sum_b = self.b1 + self.b2
+        if abs(sum_b) < 1e-9 or self.h == 0:
+            return 0.0
+        try:
+            # Esta fórmula SÍ parece corresponder a la inercia respecto al eje Y centroidal para un trapecio ISÓSCELES.
+            inertia = (self.h * (self.b1 + self.b2) * (self.b1**2 + self.b2**2)) / 48.0
+            return inertia
+        except ZeroDivisionError:
+            return 0.0
+
+    @property
+    def y_min(self):
+        return self.bc_y
+    @property
+    def y_max(self):
+        return self.bc_y + self.h
+    @property
+    def x_min(self):
+        # El mínimo X está en el borde exterior de la base o el top, el que sea más ancho
+        max_half_b = max(self.b1 / 2, self.b2 / 2) if self.b1 >= 0 and self.b2 >= 0 else 0
+        return self.bc_x - max_half_b
+    @property
+    def x_max(self):
+        max_half_b = max(self.b1 / 2, self.b2 / 2) if self.b1 >= 0 and self.b2 >= 0 else 0
+        return self.bc_x + max_half_b
+
+    def get_vertices(self, width_scale_factor=1.0):
+        """
+        Devuelve las coordenadas de los 4 vértices para dibujar.
+        El 'width_scale_factor' escala los anchos b1 y b2 (usado para visualizar homogeneización).
+        """
+        scaled_b1 = self.b1 * width_scale_factor
+        scaled_b2 = self.b2 * width_scale_factor
+        half_b1 = scaled_b1 / 2
+        half_b2 = scaled_b2 / 2
+        # bc_x es el centro de la base inferior original. El escalado se hace simétrico respecto a él.
+        return [
+            (self.bc_x - half_b1, self.bc_y),             # Bottom-left
+            (self.bc_x + half_b1, self.bc_y),             # Bottom-right
+            (self.bc_x + half_b2, self.bc_y + self.h),    # Top-right
+            (self.bc_x - half_b2, self.bc_y + self.h)     # Top-left
+        ]
+
+## FILE: shapes/rotated_steel_plate.py
+# shapes/rotated_steel_plate.py
+import numpy as np
+import math
+
+class RotatedSteelPlate:
+    """
+    Representa una chapa de acero rectangular con un espesor, definida por:
+    1) Punto inicial, punto final y espesor.
+    2) Punto inicial, vector director, longitud y espesor.
+    La chapa puede estar rotada en el plano XY.
+    """
+    def __init__(self, thickness, p1=None, p2=None, vector=None, length=None, definition_method=None):
+        """
+        Inicializa la chapa rotada.
+
+        Args:
+            thickness (float): Espesor de la chapa (será el 'ancho' local).
+            p1 (tuple, optional): Coordenadas (x1, y1) del punto inicial. Requerido si no se usa vector/length.
+            p2 (tuple, optional): Coordenadas (x2, y2) del punto final. Requerido si no se usa vector/length.
+            vector (tuple, optional): Vector director (vx, vy). Usado con p1 y length.
+            length (float, optional): Longitud de la chapa. Usado con p1 y vector.
+            definition_method (str, optional): Almacena cómo fue definida ('Points' o 'Vector') para la edición.
+        Raises:
+            ValueError: Si los argumentos de entrada no son suficientes o son inconsistentes.
+        """
+        self.t = float(thickness)
+        self.material = "steel"
+        self.definition_method = definition_method # Guardar para la edición
+
+        if self.t <= 0:
+            raise ValueError("El espesor de la chapa debe ser positivo.")
+
+        if p1 is None:
+            raise ValueError("El punto inicial 'p1' es requerido.")
+        self.p1 = np.array(p1, dtype=float)
+
+        if p2 is not None:
+            # Definición por p1 y p2
+            self.p2 = np.array(p2, dtype=float)
+            if vector is not None or length is not None:
+                # Permitir pero advertir puede ser peligroso si los datos son inconsistentes.
+                # Mejor ser estricto o elegir una prioridad clara.
+                # print("Advertencia: Se proporcionaron p1/p2 y vector/length. Se usarán p1 y p2.")
+                pass # Ignorar vector/length si se dan p1 y p2
+            diff = self.p2 - self.p1
+            self.L = np.linalg.norm(diff)
+            if self.L < 1e-9:
+                raise ValueError("Los puntos p1 y p2 son coincidentes (longitud cero).")
+            # Vector director unitario
+            self.u_dir = diff / self.L
+            # Calcular vector y longitud originales para posible edición
+            self._vector_original = tuple(diff) # Guardar vector no unitario
+            self._length_original = self.L # Guardar longitud
+            if not self.definition_method: self.definition_method = 'Points'
+
+        elif vector is not None and length is not None:
+            # Definición por p1, vector y length
+            self.L = float(length)
+            if self.L <= 0:
+                raise ValueError("La longitud 'length' debe ser positiva.")
+            v = np.array(vector, dtype=float)
+            v_norm = np.linalg.norm(v)
+            if v_norm < 1e-9:
+                raise ValueError("El vector director no puede ser cero.")
+            # Vector director unitario
+            self.u_dir = v / v_norm
+            self.p2 = self.p1 + self.L * self.u_dir
+            # Guardar vector y longitud originales para posible edición
+            self._vector_original = tuple(v)
+            self._length_original = self.L
+            if not self.definition_method: self.definition_method = 'Vector'
+        else:
+            raise ValueError("Debe proporcionar 'p2' o ('vector' y 'length').")
+
+        # Calcular ángulo con el eje X global (en radianes)
+        self.theta = math.atan2(self.u_dir[1], self.u_dir[0])
+
+        # Calcular centro de gravedad (punto medio del eje longitudinal)
+        self.cg_x = (self.p1[0] + self.p2[0]) / 2
+        self.cg_y = (self.p1[1] + self.p2[1]) / 2
+
+    @property
+    def area(self):
+        """Área de la chapa."""
+        return self.L * self.t
+
+    # --- Propiedades de Inercia ---
+    # Calculamos Ix e Iy respecto a ejes paralelos a los globales X

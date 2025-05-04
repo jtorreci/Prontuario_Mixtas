@@ -12,12 +12,12 @@ def calculate_section_properties(shapes, homogenize=False, modular_ratio=None):
     Args:
         shapes (list): Lista de objetos SteelPlate y ConcreteTrapezoid.
         homogenize (bool): True para realizar la homogeneización a acero.
-        modular_ratio (float, optional): Relación modular n = Es / Ecm. Necesario si homogenize=True.
+        modular_ratio (float, optional): Relación modular n = Es / Ecm.
+                                        Necesario si homogenize=True.
 
     Returns:
         dict: Diccionario con 'total_area', 'centroid_x', 'centroid_y',
               'inertia_x', 'inertia_y'.
-
     Raises:
         ValueError: Si se intenta homogeneizar sin un modular_ratio válido.
     """

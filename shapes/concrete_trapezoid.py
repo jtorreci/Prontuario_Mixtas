@@ -16,9 +16,9 @@ class ConcreteTrapezoid:
         self.material = "concrete"
 
         if self.h <= 0:
-             raise ValueError("La altura del trapecio debe ser positiva.")
+            raise ValueError("La altura del trapecio debe ser positiva.")
         if self.b1 < 0 or self.b2 < 0:
-             raise ValueError("Los anchos del trapecio no pueden ser negativos.")
+            raise ValueError("Los anchos del trapecio no pueden ser negativos.")
 
     @property
     def area(self):
@@ -29,9 +29,9 @@ class ConcreteTrapezoid:
         """Distancia vertical del CDG a la base inferior."""
         sum_b = self.b1 + self.b2
         if abs(sum_b) < 1e-9: # Evitar división por cero si el área es 0 (b1=b2=0)
-             # Si el área es cero, el CDG está indefinido, pero podemos devolver la mitad de la altura
-             # o manejarlo como un caso especial. Devolver h/2 es razonable.
-             return self.h / 2
+            # Si el área es cero, el CDG está indefinido, pero podemos devolver la mitad de la altura
+            # o manejarlo como un caso especial. Devolver h/2 es razonable.
+            return self.h / 2
         # Fórmula para la posición Y del Cdg respecto a la base inferior
         return (self.h / 3) * (self.b1 + 2 * self.b2) / sum_b
 

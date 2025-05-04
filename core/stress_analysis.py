@@ -4,7 +4,6 @@ import numpy as np
 def calculate_navier_stress(N_ed, Mx_ed, shapes, homog_props):
     """
     Calcula tensiones elásticas y fibra neutra usando Navier en sección homogeneizada.
-
     Args:
         N_ed (float): Esfuerzo Axil (N). Positivo = Tracción, Negativo = Compresión.
         Mx_ed (float): Momento Flector respecto a eje X centroidal (N·mm).
@@ -12,7 +11,6 @@ def calculate_navier_stress(N_ed, Mx_ed, shapes, homog_props):
         shapes (list): Lista de objetos de forma originales.
         homog_props (dict): Propiedades de la sección homogeneizada a acero
                             {'total_area', 'centroid_y', 'inertia_x'}.
-
     Returns:
         dict: Contiene 'y_na' (posición fibra neutra), 'stresses' (dict con tensiones
               en puntos clave), 'error' (mensaje de error si lo hay).
